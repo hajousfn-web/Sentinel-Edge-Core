@@ -33,3 +33,20 @@ The system categorizes sensor inputs into four distinct safety zones:
 1. **Clone the repository:**
    ```bash
    git clone [https://github.com/your-username/sentinel-edge-core.git](https://github.com/your-username/sentinel-edge-core.git)
+   Execute the kernel:
+
+Bash
+python sentinel_kernel.py
+📋 System Outputs
+sentinel.log: Full runtime operation logs.
+
+sentinel.hash: Security baseline (SHA-256).
+
+sentinel_health.json: Live system health reporting (JSON).
+
+anomaly_log.json: Detailed logs of detected statistical anomalies.
+
+👤 Author
+Soufiane Hajou Industrial Maintenance & Edge AI Specialist
+
+Built for Industry 4.0 | Privacy-First Robotics
