@@ -1,0 +1,545 @@
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║         Sentinel-Edge-Core | LiDAR-AI Kernel V5                 ║
+║         Lead Engineer : Soufiane Hajou                           ║
+║         Mode          : Zero-Cloud | Offline-First | Edge-AI     ║
+║         Target        : NVIDIA Jetson / Industrial Edge          ║
+╚══════════════════════════════════════════════════════════════════╝
+"""
+
+import time
+import logging
+import hashlib
+import os
+import sys
+import signal
+import threading
+import random
+import json
+from enum import Enum, auto
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from pathlib import Path
+from collections import deque
+from typing import Optional, List, Callable
+
+# ─────────────────────────────────────────────────────────────────
+# [CONFIG]
+# ─────────────────────────────────────────────────────────────────
+CONFIG = {
+    "version": "V5",
+    "author": "Soufiane Hajou",
+    "poll_interval":        float(os.getenv("SENTINEL_POLL_INTERVAL",    "0.1")),   # 10 Hz LiDAR
+    "log_level":                  os.getenv("SENTINEL_LOG_LEVEL",        "INFO"),
+    "log_file":                   os.getenv("SENTINEL_LOG_FILE",         "sentinel.log"),
+    "max_fault_retries":    int  (os.getenv("SENTINEL_MAX_RETRIES",      "3")),
+    "health_interval":      float(os.getenv("SENTINEL_HEALTH_INTERVAL",  "5.0")),
+    # LiDAR thresholds (metres)
+    "lidar_critical_zone":  float(os.getenv("SENTINEL_ZONE_CRITICAL",   "0.8")),
+    "lidar_warning_zone":   float(os.getenv("SENTINEL_ZONE_WARNING",    "1.5")),
+    "lidar_safe_zone":      float(os.getenv("SENTINEL_ZONE_SAFE",       "3.0")),
+    "lidar_max_range":      float(os.getenv("SENTINEL_LIDAR_MAX",      "10.0")),
+    # Anomaly detection
+    "anomaly_window":       int  (os.getenv("SENTINEL_ANOMALY_WINDOW",  "20")),    # samples
+    "anomaly_threshold":    float(os.getenv("SENTINEL_ANOMALY_THRESH",  "2.5")),   # std-devs
+}
+
+# ─────────────────────────────────────────────────────────────────
+# [LOGGING] — Terminal + File
+# ─────────────────────────────────────────────────────────────────
+def _setup_logger() -> logging.Logger:
+    logger = logging.getLogger("SentinelCore")
+    logger.setLevel(getattr(logging, CONFIG["log_level"].upper(), logging.INFO))
+    if logger.handlers:
+        return logger
+
+    fmt = logging.Formatter(
+        fmt="%(asctime)s [%(levelname)-8s] [PID:%(process)d] %(name)s — %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    for handler in (
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(CONFIG["log_file"], encoding="utf-8"),
+    ):
+        handler.setFormatter(fmt)
+        logger.addHandler(handler)
+    return logger
+
+log = _setup_logger()
+
+
+# ─────────────────────────────────────────────────────────────────
+# [EXCEPTIONS]
+# ─────────────────────────────────────────────────────────────────
+class IntegrityError(RuntimeError):   pass
+class FaultLimitExceeded(RuntimeError): pass
+class SensorReadError(IOError):       pass
+
+
+# ─────────────────────────────────────────────────────────────────
+# [STATE MACHINE] — حالات النظام الممكنة
+# ─────────────────────────────────────────────────────────────────
+class SystemState(Enum):
+    INITIALIZING   = auto()
+    OPERATIONAL    = auto()   # كل شيء طبيعي
+    WARNING        = auto()   # جسم قريب — تنبيه
+    EMERGENCY_STOP = auto()   # خطر فوري — إيقاف طارئ
+    FAULT          = auto()   # عطل داخلي
+    SHUTDOWN       = auto()   # إيقاف مخطط
+
+
+# ─────────────────────────────────────────────────────────────────
+# [DATA MODELS]
+# ─────────────────────────────────────────────────────────────────
+@dataclass
+class LidarScan:
+    """نتيجة مسح LiDAR واحد."""
+    timestamp:      str
+    distance_m:     float
+    angle_deg:      float
+    intensity:      float           # إشارة الانعكاس (0–1)
+    is_valid:       bool = True
+
+    @property
+    def zone(self) -> str:
+        if self.distance_m < CONFIG["lidar_critical_zone"]: return "CRITICAL"
+        if self.distance_m < CONFIG["lidar_warning_zone"]:  return "WARNING"
+        if self.distance_m < CONFIG["lidar_safe_zone"]:     return "CAUTION"
+        return "SAFE"
+
+
+@dataclass
+class AnomalyEvent:
+    """حدث شذوذ مكتشف."""
+    timestamp:   str
+    scan:        LidarScan
+    score:       float              # كم انحراف معياري عن المتوسط
+    action_taken: str
+
+
+@dataclass
+class SystemHealth:
+    """تقرير صحة النظام."""
+    timestamp:        str
+    state:            str
+    uptime_seconds:   float
+    total_scans:      int
+    anomalies_detected: int
+    fault_count:      int
+    last_distance_m:  Optional[float]
+    version:          str
+    pid:              int
+
+
+# ─────────────────────────────────────────────────────────────────
+# [INTEGRITY GUARD]
+# ─────────────────────────────────────────────────────────────────
+class IntegrityGuard:
+    """
+    SHA-256 على الملف الحالي.
+    أول تشغيل → يسجّل الهاش.
+    كل تشغيل بعدها → يقارن ويرفض لو تغيّر.
+    """
+    HASH_FILE = Path("sentinel.hash")
+
+    @classmethod
+    def _compute(cls) -> str:
+        sha = hashlib.sha256()
+        with open(__file__, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                sha.update(chunk)
+        return sha.hexdigest()
+
+    @classmethod
+    def register(cls) -> str:
+        h = cls._compute()
+        cls.HASH_FILE.write_text(h, encoding="utf-8")
+        log.info(f"Integrity hash registered: {h[:16]}…")
+        return h
+
+    @classmethod
+    def verify(cls) -> None:
+        """يرفع IntegrityError إذا فشل التحقق."""
+        if not cls.HASH_FILE.exists():
+            log.warning("No integrity hash found — first run, registering.")
+            cls.register()
+            return
+
+        expected = cls.HASH_FILE.read_text(encoding="utf-8").strip()
+        actual   = cls._compute()
+        if actual != expected:
+            raise IntegrityError(
+                f"Hash mismatch! expected={expected[:16]}… got={actual[:16]}…"
+            )
+        log.info("Integrity check ✅  passed.")
+
+
+# ─────────────────────────────────────────────────────────────────
+# [LIDAR ENGINE] — محرك بيانات LiDAR
+# ─────────────────────────────────────────────────────────────────
+class LidarEngine:
+    """
+    في البيئة الحقيقية: استبدل `_read_hardware()` بقراءة فعلية
+    عبر UART / USB / ROS topic.
+    الآن: محاكاة ذكية تحاكي سلوك Gaussian مع spikes عشوائية.
+    """
+
+    def __init__(self) -> None:
+        self._history: deque[float] = deque(maxlen=CONFIG["anomaly_window"])
+        self._lock = threading.Lock()
+
+    def read(self) -> LidarScan:
+        raw = self._read_hardware()
+        if not (0.0 < raw <= CONFIG["lidar_max_range"]):
+            raise SensorReadError(f"LiDAR reading out of range: {raw:.3f}m")
+
+        scan = LidarScan(
+            timestamp=datetime.utcnow().isoformat() + "Z",
+            distance_m=raw,
+            angle_deg=random.uniform(0, 360),   # في الحقيقة: من الـ driver
+            intensity=random.uniform(0.6, 1.0),
+        )
+        with self._lock:
+            self._history.append(raw)
+        return scan
+
+    def anomaly_score(self, scan: LidarScan) -> float:
+        """Z-score مقارنةً بآخر N قراءة. يرجع 0 لو ما في تاريخ كافي."""
+        with self._lock:
+            history = list(self._history)
+        if len(history) < 5:
+            return 0.0
+        mean = sum(history) / len(history)
+        std  = (sum((x - mean) ** 2 for x in history) / len(history)) ** 0.5
+        return abs(scan.distance_m - mean) / (std + 1e-9)
+
+    @staticmethod
+    def _read_hardware() -> float:
+        """
+        ← استبدل هذا بكود الـ driver الحقيقي.
+        محاكاة: معظم الوقت بعيد، أحياناً يقترب فجأة.
+        """
+        if random.random() < 0.05:                      # 5% spike خطير
+            return random.uniform(0.3, 1.4)
+        return random.gauss(mu=4.5, sigma=1.2)
+
+
+# ─────────────────────────────────────────────────────────────────
+# [HEALTH MONITOR] — Thread خلفي لتقارير الصحة
+# ─────────────────────────────────────────────────────────────────
+class HealthMonitor(threading.Thread):
+    HEALTH_FILE = Path("sentinel_health.json")
+
+    def __init__(self, get_health: Callable[[], SystemHealth], stop: threading.Event) -> None:
+        super().__init__(daemon=True, name="HealthMonitor")
+        self._get_health = get_health
+        self._stop = stop
+
+    def run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                report = asdict(self._get_health())
+                self.HEALTH_FILE.write_text(
+                    json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+            except Exception as exc:
+                log.warning(f"Health report failed: {exc}")
+            self._stop.wait(timeout=CONFIG["health_interval"])
+
+
+# ─────────────────────────────────────────────────────────────────
+# [CORE ENGINE]
+# ─────────────────────────────────────────────────────────────────
+class SentinelArchitect:
+    """
+    النواة المركزية:
+    - يقرأ LiDAR بـ 10Hz
+    - يكشف الشذوذات إحصائياً
+    - يدير State Machine للحالات
+    - يوقف النظام طارئاً عند الخطر
+    - يتعافى تلقائياً من الأعطال العابرة
+    """
+
+    def __init__(self) -> None:
+        self._state          = SystemState.INITIALIZING
+        self._stop_event     = threading.Event()
+        self._state_lock     = threading.Lock()
+        self._fault_count    = 0
+        self._total_scans    = 0
+        self._anomaly_count  = 0
+        self._last_scan: Optional[LidarScan] = None
+        self._start_time     = datetime.utcnow()
+        self._lidar          = LidarEngine()
+        self._anomaly_log: List[AnomalyEvent] = []
+        self._callbacks: dict[SystemState, List[Callable]] = {s: [] for s in SystemState}
+
+        # ربط callbacks افتراضية
+        self.on_state(SystemState.EMERGENCY_STOP, self._default_emergency_action)
+        self.on_state(SystemState.WARNING,        self._default_warning_action)
+
+        signal.signal(signal.SIGINT,  lambda s, f: self.stop())
+        signal.signal(signal.SIGTERM, lambda s, f: self.stop())
+
+    # ── State Machine ──────────────────────────────────────────
+    @property
+    def state(self) -> SystemState:
+        return self._state
+
+    def _transition(self, new_state: SystemState) -> None:
+        with self._state_lock:
+            if self._state == new_state:
+                return
+            log.info(f"State: {self._state.name} → {new_state.name}")
+            self._state = new_state
+
+        for cb in self._callbacks.get(new_state, []):
+            try:
+                cb()
+            except Exception as e:
+                log.error(f"Callback error on {new_state.name}: {e}")
+
+    def on_state(self, state: SystemState, callback: Callable) -> None:
+        """سجّل callback يُستدعى عند الدخول لحالة معيّنة."""
+        self._callbacks[state].append(callback)
+
+    # ── LiDAR Processing ───────────────────────────────────────
+    def _process_scan(self, scan: LidarScan) -> SystemState:
+        """
+        يقيّم المسح ويرجع الحالة المناسبة.
+        أولاً: Zone-based check (حتمي وسريع).
+        ثانياً: Statistical anomaly check (ذكاء إحصائي).
+        """
+        # Zone-based (hard real-time)
+        if scan.zone == "CRITICAL":
+            return SystemState.EMERGENCY_STOP
+        if scan.zone == "WARNING":
+            return SystemState.WARNING
+
+        # Statistical anomaly detection
+        score = self._lidar.anomaly_score(scan)
+        if score > CONFIG["anomaly_threshold"]:
+            event = AnomalyEvent(
+                timestamp=scan.timestamp,
+                scan=scan,
+                score=score,
+                action_taken="WARNING_ISSUED",
+            )
+            self._anomaly_log.append(event)
+            self._anomaly_count += 1
+            log.warning(
+                f"Statistical anomaly | dist={scan.distance_m:.2f}m "
+                f"z-score={score:.2f} (>{CONFIG['anomaly_threshold']})"
+            )
+            return SystemState.WARNING
+
+        return SystemState.OPERATIONAL
+
+    # ── Default Callbacks ──────────────────────────────────────
+    def _default_emergency_action(self) -> None:
+        log.critical(
+            f"🚨 EMERGENCY STOP — obstacle at "
+            f"{self._last_scan.distance_m:.2f}m "
+            f"(critical zone < {CONFIG['lidar_critical_zone']}m)"
+        )
+        # هنا: أرسل إشارة GPIO لإيقاف المحرك أو أي actuator
+
+    def _default_warning_action(self) -> None:
+        if self._last_scan:
+            log.warning(
+                f"⚠️  WARNING — object at {self._last_scan.distance_m:.2f}m "
+                f"(warning zone < {CONFIG['lidar_warning_zone']}m)"
+            )
+
+    # ── Health Report ──────────────────────────────────────────
+    def _get_health(self) -> SystemHealth:
+        uptime = (datetime.utcnow() - self._start_time).total_seconds()
+        return SystemHealth(
+            timestamp=datetime.utcnow().isoformat() + "Z",
+            state=self._state.name,
+            uptime_seconds=round(uptime, 1),
+            total_scans=self._total_scans,
+            anomalies_detected=self._anomaly_count,
+            fault_count=self._fault_count,
+            last_distance_m=round(self._last_scan.distance_m, 3) if self._last_scan else None,
+            version=CONFIG["version"],
+            pid=os.getpid(),
+        )
+
+    # ── Main Loop ──────────────────────────────────────────────
+    def _run_loop(self) -> None:
+        self._transition(SystemState.OPERATIONAL)
+        log.info(f"Monitoring loop started @ {1/CONFIG['poll_interval']:.0f} Hz.")
+
+        while not self._stop_event.is_set():
+            try:
+                scan = self._lidar.read()
+                self._last_scan = scan
+                self._total_scans += 1
+
+                new_state = self._process_scan(scan)
+                self._transition(new_state)
+
+                if new_state == SystemState.OPERATIONAL:
+                    log.info(
+                        f"[{self._total_scans:06d}] SAFE  "
+                        f"dist={scan.distance_m:.2f}m  "
+                        f"angle={scan.angle_deg:.1f}°  "
+                        f"intensity={scan.intensity:.2f}"
+                    )
+
+                self._fault_count = 0  # reset على كل دورة ناجحة
+                self._stop_event.wait(timeout=CONFIG["poll_interval"])
+
+            except SensorReadError as exc:
+                self._handle_fault(exc, recoverable=True)
+
+            except FaultLimitExceeded:
+                log.critical("Max faults exceeded — safe shutdown initiated.")
+                break
+
+            except Exception as exc:
+                self._handle_fault(exc, recoverable=False)
+
+    def _handle_fault(self, exc: Exception, *, recoverable: bool) -> None:
+        self._fault_count += 1
+        self._transition(SystemState.FAULT)
+        log.error(
+            f"Fault [{self._fault_count}/{CONFIG['max_fault_retries']}] "
+            f"({'recoverable' if recoverable else 'CRITICAL'}): {exc}",
+            exc_info=not recoverable,
+        )
+        if self._fault_count >= CONFIG["max_fault_retries"]:
+            raise FaultLimitExceeded()
+        backoff = min(2 ** self._fault_count, 30)
+        log.info(f"Retrying in {backoff}s…")
+        self._stop_event.wait(timeout=backoff)
+
+    # ── Public API ─────────────────────────────────────────────
+    def start(self) -> None:
+        self._print_banner()
+        try:
+            IntegrityGuard.verify()
+        except IntegrityError as exc:
+            log.critical(f"Integrity check FAILED: {exc}")
+            sys.exit(1)
+
+        monitor = HealthMonitor(self._get_health, self._stop_event)
+        monitor.start()
+
+        try:
+            self._run_loop()
+        finally:
+            self._transition(SystemState.SHUTDOWN)
+            self._save_anomaly_log()
+            log.info("System shut down cleanly. Goodbye.")
+
+    def stop(self) -> None:
+        log.info("Stop signal received.")
+        self._stop_event.set()
+
+    def _save_anomaly_log(self) -> None:
+        if not self._anomaly_log:
+            return
+        out = Path("anomaly_log.json")
+        data = [
+            {
+                "timestamp": e.timestamp,
+                "distance_m": e.scan.distance_m,
+                "zone": e.scan.zone,
+                "z_score": round(e.score, 3),
+                "action": e.action_taken,
+            }
+            for e in self._anomaly_log
+        ]
+        out.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        log.info(f"Anomaly log saved → {out} ({len(data)} events)")
+
+    @staticmethod
+    def _print_banner() -> None:
+        print(f"""
+╔══════════════════════════════════════════════════╗
+║  Sentinel-Edge-Core  |  {CONFIG['version']}                   ║
+║  Lead  : {CONFIG['author']}                ║
+║  Mode  : Zero-Cloud | LiDAR-Edge-AI             ║
+║  Rate  : {1/CONFIG['poll_interval']:.0f} Hz  |  PID : {os.getpid():<6}              ║
+╚══════════════════════════════════════════════════╝
+""")
+
+
+# ─────────────────────────────────────────────────────────────────
+# [README GENERATOR] — شغّلها يدوياً: python sentinel.py --docs
+# ─────────────────────────────────────────────────────────────────
+def generate_readme() -> None:
+    zones = CONFIG
+    content = f"""# 🛡️ Sentinel-Edge-Core
+### Autonomous Industrial Edge AI Kernel — {zones['version']}
+> Privacy-first · Zero-cloud · Mission-critical · LiDAR-AI Integration
+
+---
+
+## 🚀 Overview
+Real-time obstacle detection and anomaly analysis running entirely at the edge.
+No cloud. No latency. No single point of network failure.
+
+## ⚙️ Technical Highlights
+| Feature              | Value                                    |
+|----------------------|------------------------------------------|
+| Scan Rate            | ⚡ {1/CONFIG['poll_interval']:.0f} Hz (configurable)              |
+| Cloud Dependency     | ☁️ Zero — full offline operation         |
+| Anomaly Detection    | 📊 Z-score statistical (sliding window)  |
+| Integrity Check      | 🔒 SHA-256 file hash                     |
+| Fault Recovery       | 🔁 Exponential backoff auto-retry        |
+| Health Reporting     | 📋 JSON file (live)                      |
+| Target Hardware      | 🤖 NVIDIA Jetson / Edge MCU              |
+
+## 🗺️ Zone Map
+| Zone      | Distance          | Action              |
+|-----------|-------------------|---------------------|
+| CRITICAL  | < {CONFIG['lidar_critical_zone']}m             | Emergency Stop      |
+| WARNING   | {CONFIG['lidar_critical_zone']}m – {CONFIG['lidar_warning_zone']}m         | Alert + Slow-down   |
+| CAUTION   | {CONFIG['lidar_warning_zone']}m – {CONFIG['lidar_safe_zone']}m         | Log + Monitor       |
+| SAFE      | > {CONFIG['lidar_safe_zone']}m             | Normal Operation    |
+
+## 🛠️ Environment Variables
+| Variable                    | Default | Description                  |
+|-----------------------------|---------|------------------------------|
+| SENTINEL_POLL_INTERVAL      | 0.1     | Scan interval in seconds     |
+| SENTINEL_LOG_LEVEL          | INFO    | Logging verbosity            |
+| SENTINEL_ZONE_CRITICAL      | 0.8     | Emergency stop threshold (m) |
+| SENTINEL_ZONE_WARNING       | 1.5     | Warning threshold (m)        |
+| SENTINEL_ANOMALY_WINDOW     | 20      | Sliding window size          |
+| SENTINEL_ANOMALY_THRESH     | 2.5     | Z-score threshold            |
+| SENTINEL_MAX_RETRIES        | 3       | Max fault retries            |
+
+## 🚀 Quick Start
+```bash
+python sentinel_edge_core_v5.py           # تشغيل النظام
+python sentinel_edge_core_v5.py --docs    # توليد التوثيق فقط
+```
+
+## 📁 Output Files
+| File                   | Description                     |
+|------------------------|---------------------------------|
+| `sentinel.log`         | كامل سجل العمليات               |
+| `sentinel.hash`        | SHA-256 للتحقق من السلامة        |
+| `sentinel_health.json` | تقرير صحة النظام (live)          |
+| `anomaly_log.json`     | سجل الشذوذات عند الإيقاف         |
+
+---
+*Generated by Sentinel-Architect-Engine {CONFIG['version']} — {datetime.utcnow().strftime('%Y-%m-%d')}*
+*Lead: {CONFIG['author']}*
+"""
+    from datetime import datetime
+    Path("README.md").write_text(content, encoding="utf-8")
+    log.info("README.md generated ✅")
+
+
+# ─────────────────────────────────────────────────────────────────
+# [ENTRY POINT]
+# ─────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    if "--docs" in sys.argv:
+        generate_readme()
+        sys.exit(0)
+
+    SentinelArchitect().start()
