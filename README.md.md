@@ -1,52 +1,125 @@
-# Sentinel-Edge-Core
+# HumanGuard
 
-**Sentinel-Edge-Core** is an autonomous industrial Edge AI kernel designed for high-performance, offline-first safety operations. It provides real-time LiDAR data processing, anomaly detection, and safety-critical state management for industrial robotics.
+**Industrial Edge AI Safety Platform**
+
+HumanGuard is an industrial safety platform designed to help organizations improve workplace safety through real-time, on-site artificial intelligence. The platform is built around an Edge AI architecture, allowing safety monitoring and decision support to operate locally without requiring continuous cloud connectivity.
 
 ---
 
-## 🚀 Project Overview
-This project is engineered to operate entirely at the edge on industrial hardware (such as **NVIDIA Jetson**). It eliminates the need for cloud connectivity, ensuring data sovereignty and ultra-low latency response times for safety-critical environments.
+## Overview
 
-## ⚙️ Key Technical Pillars
-* **Zero-Cloud Sovereignty:** Full operational autonomy with no external network dependency.
-* **Integrity Guard:** Self-verifying codebase using **SHA-256 signatures** to prevent unauthorized tampering or modifications.
-* **Statistical Anomaly Detection:** Real-time **Z-score analysis** over a sliding window to detect subtle sensor irregularities.
-* **Fault-Tolerant Runtime:** Automated recovery mechanisms with exponential back-off strategies to ensure continuous uptime.
+HumanGuard continuously monitors industrial work areas and assists operators by identifying potential safety risks in real time. The platform is designed for environments where reliability, low latency, privacy, and operational continuity are essential.
 
-## 🗺️ Safety Zones Configuration
-The system categorizes sensor inputs into four distinct safety zones:
+The solution follows an **offline-first** philosophy, ensuring that critical safety functions remain available even when Internet connectivity is unavailable.
 
-| Zone | Distance | Action |
-| :--- | :--- | :--- |
-| **CRITICAL** | < 0.8m | Emergency Stop (Hard Stop) |
-| **WARNING** | 0.8m – 1.5m | Alert + Automated Slow-down |
-| **CAUTION** | 1.5m – 3.0m | Logging + System Monitoring |
-| **SAFE** | > 3.0m | Normal Operation |
+---
 
-## 🛠️ Deployment
+## Core Features
 
-### Prerequisites
-* Python 3.8+
-* Linux-based Industrial Edge Controller or NVIDIA Jetson device.
+* Edge AI real-time monitoring
+* Offline-first operation
+* Zero-Cloud processing for critical safety functions
+* Live operational dashboard
+* Camera management
+* Safety event notifications
+* Incident logging
+* Health monitoring
+* Watchdog supervision
+* Modular architecture for future expansion
 
-### Quick Start
-1. **Clone the repository:**
-   ```bash
-   git clone [https://github.com/your-username/sentinel-edge-core.git](https://github.com/your-username/sentinel-edge-core.git)
-   Execute the kernel:
+---
 
-Bash
-python sentinel_kernel.py
-📋 System Outputs
-sentinel.log: Full runtime operation logs.
+## Target Industries
 
-sentinel.hash: Security baseline (SHA-256).
+HumanGuard is designed for industrial environments including:
 
-sentinel_health.json: Live system health reporting (JSON).
+* Manufacturing
+* Warehouses
+* Logistics Centers
+* Industrial Automation
+* Production Facilities
+* Smart Factories
+* Retail & Commercial Facilities
+* Critical Infrastructure
 
-anomaly_log.json: Detailed logs of detected statistical anomalies.
+---
 
-👤 Author
-Soufiane Hajou Industrial Maintenance & Edge AI Specialist
+## Design Principles
 
+HumanGuard has been developed around the following principles:
+
+* Privacy by Design
+* Local AI Processing
+* Operational Continuity
+* Low-Latency Decision Support
+* Modular System Architecture
+* Industrial Reliability
+* Scalable Deployment
+
+---
+
+## Current Status
+
+Current development stage:
+
+**Minimum Viable Product (MVP)**
+
+The platform is currently under active development and validation for industrial environments.
+
+Future releases will continue expanding capabilities while maintaining compatibility with the existing architecture.
+
+---
+
+## Technology Focus
+
+HumanGuard combines modern software engineering practices with industrial safety concepts, focusing on:
+
+* Edge Computing
+* Industrial AI
+* Computer Vision
+* Real-Time Monitoring
+* Safety Automation
+* Human-Centered Industrial Systems
+
+---
+
+## Roadmap
+
+Planned areas of development include:
+
+* Multi-camera management
+* Advanced PPE compliance
+* Enhanced analytics
+* Industrial integrations
+* Enterprise deployment
+* Remote management capabilities
+* Additional Edge AI modules
+
+---
+
+## Documentation
+
+Additional technical documentation, architecture descriptions, deployment guides, and demonstrations will be published as the project evolves.
+
+---
+
+## License
+
+All rights reserved.
+
+This repository is intended to present the HumanGuard project and its ongoing development.
+
+The source code, algorithms, internal architecture, and proprietary implementation details are not licensed for copying, redistribution, or commercial use without explicit written permission from the author.
+
+---
+
+## Author
+
+**Soufiane Hajou**
+
+Founder & CTO
+
+Industrial Edge AI Safety Platform
+
+Building next-generation industrial safety solutions powered by Edge AI.
 Built for Industry 4.0 | Privacy-First Robotics
